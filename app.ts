@@ -834,8 +834,67 @@ export function planFetch(
   haves: string[],
   shallowBoundary: string[],
   deepen: number | null,
+  deepenRelative = false,
+  deepenSince: number | null = null,
+  deepenNot: string[] = [],
 ): FetchPlan {
   const shallowSet = new Set(shallowBoundary);
+  // Parents are parsed from the commit buffer on every call; a fetch
+  // walks the same history several times (held set, wanted history,
+  // depth walks, shallow boundaries), so memoize them for this call.
+  const parentsCache = new Map<string, string[]>();
+  const parentsOf = (oid: string): string[] => {
+    const hit = parentsCache.get(oid);
+    if (hit !== undefined) return hit;
+    const parents = commitParents(repo, oid);
+    parentsCache.set(oid, parents);
+    return parents;
+  };
+  // `--shallow-since` / `--shallow-exclude` (deepen-since / deepen-not):
+  // commits older than the date, and commits reachable from an excluded
+  // ref, are pruned from the walk — never included, never traversed past.
+  // An unresolvable exclusion ref is a hard error, as in real git.
+  const tsCache = new Map<string, number>();
+  const committerTsOf = (oid: string): number => {
+    const hit = tsCache.get(oid);
+    if (hit !== undefined) return hit;
+    const obj = repo.objects.get(oid);
+    const ts = obj?.type === 'commit' ? parseCommit(obj.data).committerTs : 0;
+    tsCache.set(oid, ts);
+    return ts;
+  };
+  const excluded = new Set<string>();
+  for (const entry of deepenNot) {
+    let tip: string | null = null;
+    const candidates = [entry, `refs/${entry}`, `refs/heads/${entry}`, `refs/tags/${entry}`];
+    for (const ref of candidates) {
+      const oid = repo.refs.get(ref) ?? (isSha(ref) ? ref : undefined);
+      if (oid && repo.objects.get(oid)?.type === 'commit') {
+        tip = oid;
+        break;
+      }
+      if (oid && repo.objects.get(oid)?.type === 'tag') {
+        const target = parseTag(repo.objects.get(oid)!.data).object;
+        if (repo.objects.get(target)?.type === 'commit') {
+          tip = target;
+          break;
+        }
+      }
+    }
+    if (tip === null) throw new Error(`ambiguous deepen-not: ${entry}`);
+    const stack = [tip];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (!oid || excluded.has(oid)) continue;
+      excluded.add(oid);
+      for (const parent of parentsOf(oid)) stack.push(parent);
+    }
+  }
+  const includable = (oid: string): boolean => {
+    if (excluded.has(oid)) return false;
+    if (deepenSince !== null && committerTsOf(oid) < deepenSince) return false;
+    return true;
+  };
   // Objects the client already holds: reachable from haves, but traversal
   // stops at shallow-boundary commits (their parents are not held).
   const held = new Set<string>();
@@ -863,46 +922,95 @@ export function planFetch(
       }
     }
   }
-  // Commits to include: BFS from wants, generation-limited by deepen.
-  const includedCommits = new Map<string, number>(); // oid -> generation (1-based)
-  const queue: { oid: string; gen: number }[] = wants
-    .filter((w) => repo.objects.get(w)?.type === 'commit')
-    .map((w) => ({ oid: w, gen: 1 }));
-  // Wants may also be annotated tags: resolve to the commit.
+  // Resolve wants to commit oids (annotated tags resolve to their commit).
+  const wantCommits: string[] = [];
   for (const want of wants) {
     const obj = repo.objects.get(want);
-    if (obj?.type === 'tag') {
+    if (obj?.type === 'commit') wantCommits.push(want);
+    else if (obj?.type === 'tag') {
       const target = parseTag(obj.data).object;
-      if (repo.objects.get(target)?.type === 'commit') {
-        queue.push({ oid: target, gen: 1 });
+      if (repo.objects.get(target)?.type === 'commit') wantCommits.push(target);
+    }
+  }
+  // Every commit in the wanted history (no depth limit): shallow and
+  // unshallow lines are only ever reported for these.
+  const wantAncestors = new Set<string>();
+  {
+    const stack = [...wantCommits];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (!oid || wantAncestors.has(oid)) continue;
+      wantAncestors.add(oid);
+      for (const parent of parentsOf(oid)) stack.push(parent);
+    }
+  }
+  // Commits to include: walk A counts `deepen` generations from the wants
+  // (an absolute depth, as in a fresh `--depth N` clone).
+  const included = new Set<string>();
+  {
+    const queue: { oid: string; gen: number }[] = wantCommits.map((oid) => ({ oid, gen: 1 }));
+    while (queue.length > 0) {
+      const { oid, gen } = queue.shift()!;
+      if (included.has(oid) || !includable(oid)) continue;
+      included.add(oid);
+      if (deepen !== null && gen >= deepen) continue;
+      for (const parent of parentsOf(oid)) {
+        if (!included.has(parent)) queue.push({ oid: parent, gen: gen + 1 });
       }
     }
   }
+  // Walk B: `deepen-relative` (git fetch --deepen) extends the history by
+  // `deepen` generations *below* each shallow boundary reachable from a
+  // want. Walk A counts from the wants, so without this a deepen request
+  // gains nothing: the boundary commit itself sits at generation 1.
+  if (deepen !== null && deepenRelative) {
+    const reachable = new Set<string>();
+    const seen = new Set<string>();
+    const stack = [...wantCommits];
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      if (seen.has(oid)) continue;
+      seen.add(oid);
+      if (shallowSet.has(oid)) {
+        reachable.add(oid);
+        continue;
+      }
+      for (const parent of parentsOf(oid)) stack.push(parent);
+    }
+    for (const boundary of reachable) {
+      const q: { oid: string; dist: number }[] = [{ oid: boundary, dist: 0 }];
+      const done = new Set<string>([boundary]);
+      while (q.length > 0) {
+        const { oid, dist } = q.shift()!;
+        if (dist >= deepen) continue;
+        for (const parent of parentsOf(oid)) {
+          if (!done.has(parent)) {
+            done.add(parent);
+            if (includable(parent)) {
+              included.add(parent);
+              q.push({ oid: parent, dist: dist + 1 });
+            }
+          }
+        }
+      }
+    }
+  }
+  // Shallow boundaries, from what the client will hold after this fetch
+  // (held ∪ included), restricted to the wanted history: a commit is a
+  // boundary when at least one parent is still missing; a former boundary
+  // whose parents are all present now is unshallow.
+  const heldAndIncluded = new Set<string>([...held, ...included]);
   const shallow: string[] = [];
-  while (queue.length > 0) {
-    const { oid, gen } = queue.shift()!;
-    if (includedCommits.has(oid)) continue;
-    includedCommits.set(oid, gen);
-    const atLimit = deepen !== null && gen >= deepen;
-    const parents = commitParents(repo, oid);
-    if (atLimit) {
-      if (parents.length > 0) shallow.push(oid);
-    } else {
-      for (const parent of parents) {
-        if (!includedCommits.has(parent)) queue.push({ oid: parent, gen: gen + 1 });
-      }
-    }
+  for (const oid of wantAncestors) {
+    if (!heldAndIncluded.has(oid)) continue;
+    const parents = parentsOf(oid);
+    if (parents.length > 0 && parents.some((p) => !heldAndIncluded.has(p))) shallow.push(oid);
   }
-  // Shallow boundary also moves when a deepen extends past an old boundary:
-  // commits that were shallow and are now included with parents included
-  // become unshallow.
   const unshallow: string[] = [];
   for (const boundary of shallowBoundary) {
-    if (includedCommits.has(boundary)) {
-      const gen = includedCommits.get(boundary)!;
-      const atLimit = deepen !== null && gen >= deepen;
-      if (!atLimit) unshallow.push(boundary);
-    }
+    if (!wantAncestors.has(boundary) || !heldAndIncluded.has(boundary)) continue;
+    const parents = parentsOf(boundary);
+    if (parents.every((p) => heldAndIncluded.has(p))) unshallow.push(boundary);
   }
   // Send set: objects reachable from included commits *without* walking
   // past an included commit's parents (depth-limited), plus wanted tags,
@@ -913,7 +1021,7 @@ export function planFetch(
     const obj = repo.objects.get(want);
     if (obj?.type === 'tag') sendStack.push(want);
   }
-  for (const oid of includedCommits.keys()) sendStack.push(oid);
+  for (const oid of included) sendStack.push(oid);
   while (sendStack.length > 0) {
     const oid = sendStack.pop()!;
     if (!oid || isZeroOid(oid) || sendSet.has(oid) || held.has(oid)) continue;
@@ -924,7 +1032,7 @@ export function planFetch(
       const info = parseCommit(obj.data);
       sendStack.push(info.tree);
       for (const parent of info.parents) {
-        if (includedCommits.has(parent)) sendStack.push(parent);
+        if (included.has(parent)) sendStack.push(parent);
       }
     } else if (obj.type === 'tree') {
       for (const entry of parseTree(obj.data)) sendStack.push(entry.oid);
@@ -933,10 +1041,13 @@ export function planFetch(
     }
   }
   const sendOids: string[] = [...sendSet];
-  // Common commits for ACK: haves that are ancestors of a want.
+  // Common commits for ACK: any have the server actually holds. Real git
+  // acks a have it has even when it is not an ancestor of a want, and
+  // silently ignores a have it does not have; the NAK case is handled by
+  // the caller (a NAK response carries no further sections).
   const common: string[] = [];
   for (const have of haves) {
-    if (have && !isZeroOid(have) && wants.some((w) => isAncestor(repo, have, w))) {
+    if (have && !isZeroOid(have) && repo.objects.has(have) && !common.includes(have)) {
       common.push(have);
     }
   }
@@ -1166,6 +1277,12 @@ function shortBranch(ref: string): string {
   return idx >= 0 ? ref.slice(idx + 1) : ref;
 }
 
+// GitHub repository names contain only ASCII letters, digits, hyphens,
+// underscores, and periods.
+function isValidRepoName(name: string): boolean {
+  return /^[A-Za-z0-9._-]+$/.test(name);
+}
+
 // ---------------------------------------------------------------------------
 // REST v3 routing.
 // ---------------------------------------------------------------------------
@@ -1212,6 +1329,10 @@ async function handleRest(
       const name = asString(input.name);
       if (name === '') {
         sendError(res, 422, 'Repository name is required');
+        return true;
+      }
+      if (!isValidRepoName(name)) {
+        sendError(res, 422, 'Repository name may only contain letters, digits, hyphens, underscores, and periods');
         return true;
       }
       const existing = getRepo(VIEWER.login, name);
@@ -1324,7 +1445,7 @@ async function handleRepoRest(
           protected: false,
         }))
         .sort((a, b) => (a.name < b.name ? -1 : 1));
-      sendJson(res, 200, list);
+      sendJson(res, 200, paginate(req, res, list));
       return true;
     }
     if (method === 'GET' && tail.length === 2) {
@@ -1350,7 +1471,7 @@ async function handleRepoRest(
         if (item) items.push(item);
       }
     }
-    sendJson(res, 200, items);
+    sendJson(res, 200, paginate(req, res, items));
     return true;
   }
 
@@ -1362,7 +1483,7 @@ async function handleRepoRest(
   // labels
   if (head === 'labels') {
     if (method === 'GET' && tail.length === 1) {
-      sendJson(res, 200, [...repo.labels.values()].map((label) => labelJson(label, repo)));
+      sendJson(res, 200, paginate(req, res, [...repo.labels.values()].map((label) => labelJson(label, repo))));
       return true;
     }
     if (method === 'POST' && tail.length === 1) {
@@ -1608,6 +1729,10 @@ function createPull(
   const baseSha = repo.refs.get(`refs/heads/${baseRef}`);
   if (title === '' || !headSha || !baseSha) {
     sendError(res, 422, 'Invalid head or base');
+    return true;
+  }
+  if (headSha === baseSha || isAncestor(repo, headSha, baseSha)) {
+    sendError(res, 422, `No commits between ${headRef} and ${baseRef}`);
     return true;
   }
   const number = repo.nextNumber;
@@ -2102,6 +2227,10 @@ function handleFetchV2(
   const haves: string[] = [];
   const shallow: string[] = [];
   let deepen: number | null = null;
+  let deepenRelative = false;
+  let deepenSince: number | null = null;
+  const deepenNot: string[] = [];
+  let done = false;
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
     const line = packet.payload.toString('utf8').trim();
@@ -2111,9 +2240,22 @@ function handleFetchV2(
     else if (line.startsWith('deepen ')) {
       const n = Number(line.slice(7).trim());
       if (Number.isFinite(n) && n > 0) deepen = n;
-    }
+    } else if (line === 'deepen-relative') deepenRelative = true;
+    else if (line.startsWith('deepen-since ')) {
+      const n = Number(line.slice('deepen-since '.length).trim());
+      if (Number.isFinite(n) && n > 0) deepenSince = n;
+    } else if (line.startsWith('deepen-not ')) {
+      deepenNot.push(line.slice('deepen-not '.length).trim());
+    } else if (line === 'done') done = true;
   }
-  const plan = planFetch(repo, wants, haves, shallow, deepen);
+  let plan: FetchPlan;
+  try {
+    plan = planFetch(repo, wants, haves, shallow, deepen, deepenRelative, deepenSince, deepenNot);
+  } catch (err) {
+    res.writeHead(400, { 'content-type': 'text/plain' });
+    res.end(`error: ${err instanceof Error ? err.message : 'fetch failed'}\n`);
+    return true;
+  }
   const out: Buffer[] = [];
   // The v2 sections are acknowledgments, shallow-info, packfile, in that
   // order; intermediate sections end with DELIM, the last with FLUSH.
@@ -2122,21 +2264,36 @@ function handleFetchV2(
   if (haves.length > 0) {
     out.push(pktText('acknowledgments'));
     if (plan.common.length > 0) {
-      out.push(pktText(`ACK ${plan.common[0]}`));
+      for (const oid of plan.common) out.push(pktText(`ACK ${oid}`));
       out.push(pktText('ready'));
+      out.push(DELIM);
     } else {
+      // No common commits: real git answers NAK and ends the response
+      // here: the acknowledgments section is closed by FLUSH, not DELIM,
+      // because no further section follows. (A DELIM here tells git
+      // another section is coming, and it aborts: "expected no other
+      // sections to be sent after no 'ready'".) The client then sends a
+      // second request (with `done`, no haves) and the packfile comes in
+      // that round.
       out.push(pktText('NAK'));
+      out.push(FLUSH);
+      res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
+      res.end(Buffer.concat(out));
+      return true;
     }
-    out.push(DELIM);
   }
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
+  // Send the shallow-info section whenever there are lines to report, or
+  // (first round only) when the client sent shallow lines: real git sends
+  // the section empty in that case.
+  if (plan.shallow.length > 0 || plan.unshallow.length > 0 || (!done && shallow.length > 0)) {
     out.push(pktText('shallow-info'));
     for (const oid of plan.shallow) out.push(pktText(`shallow ${oid}`));
     for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
     out.push(DELIM);
   }
   // No wants (empty-repo clone) means no packfile section at all: an empty
-  // pack would still count as transferred bytes.
+  // pack would still count as transferred bytes. The response still ends
+  // with FLUSH, never a dangling DELIM.
   if (wants.length > 0) {
     out.push(pktText('packfile'));
     const pack = buildFetchPack(repo, plan);
@@ -2144,6 +2301,8 @@ function handleFetchV2(
     for (let i = 0; i < pack.length; i += chunkSize) {
       out.push(sideband(1, pack.subarray(i, Math.min(pack.length, i + chunkSize))));
     }
+    out.push(FLUSH);
+  } else {
     out.push(FLUSH);
   }
   res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-result' });
@@ -2160,6 +2319,9 @@ function handleFetchV0(
   const haves: string[] = [];
   const shallow: string[] = [];
   let deepen: number | null = null;
+  let deepenRelative = false;
+  let deepenSince: number | null = null;
+  const deepenNot: string[] = [];
   let seenFlush = false;
   for (const packet of packets) {
     if (packet.kind === 'flush') {
@@ -2177,12 +2339,25 @@ function handleFetchV0(
     } else if (line.startsWith('deepen ')) {
       const n = Number(line.slice(7).trim());
       if (Number.isFinite(n) && n > 0) deepen = n;
+    } else if (line === 'deepen-relative') deepenRelative = true;
+    else if (line.startsWith('deepen-since ')) {
+      const n = Number(line.slice('deepen-since '.length).trim());
+      if (Number.isFinite(n) && n > 0) deepenSince = n;
+    } else if (line.startsWith('deepen-not ')) {
+      deepenNot.push(line.slice('deepen-not '.length).trim());
     } else if (line === 'done') {
       break;
     }
     void seenFlush;
   }
-  const plan = planFetch(repo, wants, haves, shallow, deepen);
+  let plan: FetchPlan;
+  try {
+    plan = planFetch(repo, wants, haves, shallow, deepen, deepenRelative, deepenSince, deepenNot);
+  } catch (err) {
+    res.writeHead(400, { 'content-type': 'text/plain' });
+    res.end(`error: ${err instanceof Error ? err.message : 'fetch failed'}\n`);
+    return true;
+  }
   const out: Buffer[] = [];
   for (const oid of plan.shallow) out.push(pktText(`shallow ${oid}`));
   for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
@@ -2586,6 +2761,9 @@ function newPullRecord(repo: Repo, title: string, body: string, head: string, ba
   const headSha = repo.refs.get(`refs/heads/${head}`);
   const baseSha = repo.refs.get(`refs/heads/${base}`);
   if (!headSha || !baseSha) return null;
+  // Like real GitHub: a pull request with no commits between head and base
+  // (same branch, or head already fully merged into base) is rejected.
+  if (headSha === baseSha || isAncestor(repo, headSha, baseSha)) return null;
   const number = repo.nextNumber;
   repo.nextNumber += 1;
   const now = nowIso();
@@ -3334,6 +3512,9 @@ function callMcpTool(
   const repoName = String(args.repo ?? args.name ?? '');
   if (name === 'create_repo') {
     const repoNameArg = String(args.name);
+    if (!isValidRepoName(repoNameArg)) {
+      return { ok: false, code: -32602, message: 'Invalid repository name' };
+    }
     const existing = getRepo(VIEWER.login, repoNameArg);
     if (existing) return { ok: true, value: repoJson(existing) };
     const repo = createRepoRecord(
