@@ -2115,8 +2115,10 @@ function handleFetchV2(
   }
   const plan = planFetch(repo, wants, haves, shallow, deepen);
   const out: Buffer[] = [];
-  // Protocol v2 sends the acknowledgments section only when the client
-  // sent have lines; with no haves the client expects packfile next.
+  // The v2 sections are acknowledgments, shallow-info, packfile, in that
+  // order; intermediate sections end with DELIM, the last with FLUSH.
+  // (The kit reads sections generically; real git's reader is order-strict,
+  // so the ack section must come first whenever haves were sent.)
   if (haves.length > 0) {
     out.push(pktText('acknowledgments'));
     if (plan.common.length > 0) {
@@ -2125,13 +2127,13 @@ function handleFetchV2(
     } else {
       out.push(pktText('NAK'));
     }
-    out.push(FLUSH);
+    out.push(DELIM);
   }
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     out.push(pktText('shallow-info'));
-    for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
     for (const oid of plan.shallow) out.push(pktText(`shallow ${oid}`));
-    out.push(FLUSH);
+    for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
+    out.push(DELIM);
   }
   // No wants (empty-repo clone) means no packfile section at all: an empty
   // pack would still count as transferred bytes.
@@ -2182,8 +2184,8 @@ function handleFetchV0(
   }
   const plan = planFetch(repo, wants, haves, shallow, deepen);
   const out: Buffer[] = [];
-  for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
   for (const oid of plan.shallow) out.push(pktText(`shallow ${oid}`));
+  for (const oid of plan.unshallow) out.push(pktText(`unshallow ${oid}`));
   if (haves.length === 0) out.push(pktText('NAK'));
   else if (plan.common.length > 0) out.push(pktText(`ACK ${plan.common[0]}`));
   else out.push(pktText('NAK'));
